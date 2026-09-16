@@ -109,23 +109,23 @@ SEND_STABLE_INTERVAL_MS = 500
 SEND_INITIAL_CLEAN_GRACE_MS = 2_000
 
 
-async def send_message(page: Page, chat: DouyinChat, message: Message, stickers: dict[str, Sticker]) -> None:
+async def send_message(page: Page, chat: DouyinChat, message: Message, stickers: dict[str, Sticker], max_retries: int = 2) -> None:
     if message.type == "random":
-        await send_message(page, chat, random.choice(message.choices), stickers)
+        await send_message(page, chat, random.choice(message.choices), stickers, max_retries)
         return
     if message.type == "text":
-        await send_text(chat, message.content or "")
+        await send_text(chat, message.content or "", max_retries)
         return
     if message.type == "image":
         if message.path is None:
             raise PageOperationError("图片消息缺少文件路径")
-        await send_image(page, message.path.as_posix())
+        await send_image(page, message.path.as_posix(), max_retries)
         return
     if message.type == "douyin_sticker":
         sticker = stickers.get(message.sticker or "")
         if sticker is None:
             raise PageOperationError(f"没有原生表情映射: {message.sticker}")
-        await send_douyin_sticker(page, sticker)
+        await send_douyin_sticker(page, sticker, max_retries)
         return
     raise PageOperationError(f"不支持的消息类型: {message.type}")
 
@@ -205,47 +205,59 @@ async def _restore_composer(page: Page, timeout_ms: int = 10_000) -> None:
         pass
 
 
-async def send_douyin_sticker(page: Page, sticker: Sticker) -> None:
-    before = await _mark_latest_outgoing_message(page)
-    try:
-        button = await first_visible(page, STICKER_BUTTONS)
-        await button.click(force=True)
-        panel = await first_visible(page, STICKER_PANELS)
+async def send_douyin_sticker(page: Page, sticker: Sticker, max_retries: int = 2) -> None:
+    last_exception: Exception | None = None
+    
+    for attempt in range(max_retries + 1):
+        try:
+            before = await _mark_latest_outgoing_message(page)
+            try:
+                button = await first_visible(page, STICKER_BUTTONS)
+                await button.click(force=True)
+                panel = await first_visible(page, STICKER_PANELS)
 
-        if sticker.category:
-            category = panel.get_by_text(sticker.category, exact=True)
-            if await category.count() and await category.first.is_visible():
-                await category.first.click()
+                if sticker.category:
+                    category = panel.get_by_text(sticker.category, exact=True)
+                    if await category.count() and await category.first.is_visible():
+                        await category.first.click()
 
-        name = sticker.accessible_name or sticker.name
-        item = panel.locator('.emojiEmojiItememojiItem').filter(has_text=name)
-        for index in range(await item.count()):
-            candidate = item.nth(index)
-            description = candidate.locator('.emojiEmojiItememojiItemDesc')
-            if await description.count() and (await description.first.inner_text()).strip() == name:
-                await _click_and_confirm_sticker(page, candidate, before, name)
-                return
+                name = sticker.accessible_name or sticker.name
+                item = panel.locator('.emojiEmojiItememojiItem').filter(has_text=name)
+                for index in range(await item.count()):
+                    candidate = item.nth(index)
+                    description = candidate.locator('.emojiEmojiItememojiItemDesc')
+                    if await description.count() and (await description.first.inner_text()).strip() == name:
+                        await _click_and_confirm_sticker(page, candidate, before, name)
+                        return
 
-        candidates = (
-            panel.get_by_role("img", name=name, exact=True),
-            panel.get_by_role("button", name=name, exact=True),
-            panel.locator(f'[aria-label="{_css_escape(name)}"]'),
-            panel.locator(f'[title="{_css_escape(name)}"]'),
-            panel.locator(f'[alt="{_css_escape(name)}"]'),
-        )
-        for candidate in candidates:
-            if await candidate.count() and await candidate.first.is_visible():
-                await _click_and_confirm_sticker(page, candidate.first, before, name)
-                return
+                candidates = (
+                    panel.get_by_role("img", name=name, exact=True),
+                    panel.get_by_role("button", name=name, exact=True),
+                    panel.locator(f'[aria-label="{_css_escape(name)}"]'),
+                    panel.locator(f'[title="{_css_escape(name)}"]'),
+                    panel.locator(f'[alt="{_css_escape(name)}"]'),
+                )
+                for candidate in candidates:
+                    if await candidate.count() and await candidate.first.is_visible():
+                        await _click_and_confirm_sticker(page, candidate.first, before, name)
+                        return
 
-        if sticker.fallback_index is not None:
-            items = panel.locator('[role="button"], img, [aria-label], [title]')
-            if await items.count() > sticker.fallback_index:
-                await _click_and_confirm_sticker(page, items.nth(sticker.fallback_index), before, name)
-                return
-        raise PageOperationError(f"在抖音表情面板中找不到原生表情: {sticker.name}")
-    finally:
-        await _restore_composer(page)
+                if sticker.fallback_index is not None:
+                    items = panel.locator('[role="button"], img, [aria-label], [title]')
+                    if await items.count() > sticker.fallback_index:
+                        await _click_and_confirm_sticker(page, items.nth(sticker.fallback_index), before, name)
+                        return
+                raise PageOperationError(f"在抖音表情面板中找不到原生表情: {sticker.name}")
+            finally:
+                await _restore_composer(page)
+        except PageOperationError as exc:
+            last_exception = exc
+            # 如果包含"可以重试"说明是暂时性错误，进行重试
+            if attempt < max_retries and "可以重试" in str(exc):
+                await page.wait_for_timeout(1_500)  # 等待 1.5 秒后重试
+                continue
+            else:
+                raise
 
 
 def _css_escape(value: str) -> str:
@@ -297,7 +309,7 @@ async def _confirm_sticker_sent(
     name: str,
     resource_key: str = "",
 ) -> None:
-    await _confirm_outgoing_message(page, before, f"原生表情“{name}”", resource_key=resource_key)
+    await _confirm_outgoing_message(page, before, f"原生表情"{name}"", resource_key=resource_key)
 
 
 async def _marker_visible(scope: Locator, selectors: tuple[str, ...]) -> bool:
